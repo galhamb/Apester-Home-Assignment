@@ -1,0 +1,80 @@
+# imports
+
+import pyspark
+import pandas as pd
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import sum,min,col,lit
+import time
+
+# in order to calculate run time
+
+start_time = time.time()
+
+
+# create spark session
+
+spark = SparkSession.builder.appName("Apester").getOrCreate()
+
+# load files
+
+csvPandasDF = pd.read_csv("all_video_advertisers.csv", skiprows=6) # using pandas in order to skip rows
+jsonDF= spark.read.json("Rubicon.json",multiLine=True)
+
+
+# ETL
+
+csvDF=spark.createDataFrame(csvPandasDF).withColumn("Sort", lit(2)).\
+    withColumnRenamed("Advertiser Name", "Advertiser") # convert pandas DF to spark DF+rename column
+
+jsonRubiconFinalDF=jsonDF.filter(jsonDF["Ad Format"] == "Video").withColumn("Sort", lit(1)).\
+    withColumn("Advertiser Name", lit("Rubicon")).drop("Ad Format").\
+    withColumnRenamed("Publisher Net Revenue", "Revenue").\
+    withColumnRenamed("Referring Domain", "Domain").\
+    withColumnRenamed("Advertiser Name", "Advertiser")  # 1 .filter data+rename columns+add column+drop column
+                                                        # 2. this is relevant data which will be loaded to the target  later on
+    
+    
+restAdvertisersDF=csvDF.filter(csvDF["Advertiser"] != "Rubicon") # all the csv data without Rubicon - will be loaded to the target later on
+
+csvRubiconDF=csvDF.filter(csvDF["Advertiser"] == "Rubicon")  # csv Rubicon data
+
+csvRubiconDFGranular=csvRubiconDF.withColumn("IsUpdated", lit(0)) # in order to identify the relevant rows from csv
+
+rubiconDF=jsonRubiconFinalDF.unionByName(csvRubiconDF) # all Rubicon data united (containes non relevant rows)
+
+rubiconDF.createOrReplaceTempView("Rubicon") # create view
+
+rubiconRelevantDataDF=spark.sql("select 'Rubicon' as Advertiser,1 as IsUpdated,-100 as Revenue,\
+                    Date,Domain,min(Sort)as Sort \
+                    from Rubicon group by Date,Domain having min(Sort)=2") #  get the data needs to be inserted from the csv
+
+rubiconRelevantDataDF.unionByName(csvRubiconDFGranular).createOrReplaceTempView("RubiconGranular")
+
+csvRubiconFinalDF=spark.sql("select Date,Domain,Advertiser,max(IsUpdated)IsUpdated,max(Revenue)Revenue\
+          from RubiconGranular group by Date,Domain,Advertiser having max(IsUpdated)=1") # Get the final Rubicaon csv population needed to be loaded to the target  
+
+csvRubiconFinalDF=csvRubiconFinalDF.drop("IsUpdated")  #Remove prev used columns in order to union all DF's
+jsonRubiconFinalDF=jsonRubiconFinalDF.drop("Sort")
+restAdvertisersFinalDF=restAdvertisersDF.drop("Sort")
+
+restAdvertisersFinalDF.unionByName(jsonRubiconFinalDF).unionByName(csvRubiconFinalDF)\
+.createOrReplaceTempView("Final")
+
+FinalDF=spark.sql("select Advertiser,Date\
+                ,split(replace(replace(replace(Domain,'www.',''),'https://',''),'http://',''),'/')[0]\
+                 as Domain,sum(Revenue) as Revenue from Final group by\
+                 Advertiser,Date,\
+                 split(replace(replace(replace(Domain,'www.',''),'https://',''),'http://',''),'/')[0]\
+                 order by Date,Advertiser,Domain")
+
+
+FinalDF.write.csv("/tmp/gal/datacsv")
+
+
+# Print Run Time
+
+print("--- %s seconds ---" % (time.time() - start_time))
+
+   
+
+
